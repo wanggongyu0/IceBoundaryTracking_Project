@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Large experiment data
+*.novel
+*.mat
+*.h5
+*.hdf5
+*.npy
+*.npz
+
+# Results
+result/
+results/
+overlays/
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
