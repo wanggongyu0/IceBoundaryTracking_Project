@@ -755,5 +755,3 @@ if __name__ == "__main__":
     )
 
     run_tracking(cfg)
-    #哈哈哈
-我是你爸
