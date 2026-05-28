@@ -4,3 +4,4 @@ pandas
 matplotlib
 scipy
 h5py
+PyYAML

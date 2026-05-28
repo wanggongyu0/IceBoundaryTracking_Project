@@ -14,8 +14,9 @@ ice_boundary_tracking_h5py_fix.py
 import os
 import glob
 import json
+import argparse
 from pathlib import Path
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, fields
 from datetime import datetime
 from typing import Optional, Tuple
 
@@ -25,6 +26,11 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.io import loadmat
+
+try:
+    import yaml
+except ImportError:
+    yaml = None
 
 
 @dataclass
@@ -106,6 +112,109 @@ def save_config_used(cfg: Config):
 
     with open(config_path, "w", encoding="utf-8") as f:
         json.dump(asdict(cfg), f, ensure_ascii=False, indent=2)
+
+
+def normalize_yaml_config_value(key: str, value):
+    tuple_fields = {
+        "roi": 4,
+        "ref_roi": 4,
+        "visible_complete_interval_s": 2,
+    }
+
+    if key not in tuple_fields:
+        return value
+
+    if value is None:
+        return None
+
+    if not isinstance(value, (list, tuple)):
+        raise ValueError(f"config field '{key}' must be a list/tuple or null")
+
+    expected_len = tuple_fields[key]
+    if len(value) != expected_len:
+        raise ValueError(f"config field '{key}' must contain {expected_len} values")
+
+    return tuple(value)
+
+
+def parse_simple_yaml_scalar(value: str):
+    value = value.strip()
+
+    if value in ("", "null", "Null", "NULL", "~"):
+        return None
+    if value in ("true", "True", "TRUE"):
+        return True
+    if value in ("false", "False", "FALSE"):
+        return False
+
+    if value.startswith("[") and value.endswith("]"):
+        inner = value[1:-1].strip()
+        if not inner:
+            return []
+        return [parse_simple_yaml_scalar(part.strip()) for part in inner.split(",")]
+
+    if (value.startswith('"') and value.endswith('"')) or (value.startswith("'") and value.endswith("'")):
+        return value[1:-1]
+
+    try:
+        return int(value)
+    except ValueError:
+        pass
+
+    try:
+        return float(value)
+    except ValueError:
+        return value
+
+
+def load_simple_yaml_config_dict(path: Path) -> dict:
+    data = {}
+    with open(path, "r", encoding="utf-8") as f:
+        for line_number, raw_line in enumerate(f, start=1):
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" not in line:
+                raise ValueError(f"invalid config line {line_number}: {raw_line.rstrip()}")
+            key, value = line.split(":", 1)
+            key = key.strip()
+            if not key:
+                raise ValueError(f"empty config key at line {line_number}")
+            data[key] = parse_simple_yaml_scalar(value)
+    return data
+
+
+def load_config_from_yaml(config_path: str) -> Config:
+    """
+    Load Config values from a YAML file.
+
+    YAML keys must match Config field names. Values in the YAML file override
+    Config dataclass defaults; unspecified fields keep their default values.
+    """
+    path = Path(config_path)
+    if not path.exists():
+        raise FileNotFoundError(f"config file not found: {config_path}")
+
+    if yaml is not None:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    else:
+        data = load_simple_yaml_config_dict(path)
+
+    if not isinstance(data, dict):
+        raise ValueError("config yaml must contain a mapping/object at the top level")
+
+    valid_fields = {field.name for field in fields(Config)}
+    unknown_fields = sorted(set(data.keys()) - valid_fields)
+    if unknown_fields:
+        raise ValueError(f"unknown config field(s): {', '.join(unknown_fields)}")
+
+    values = {field.name: getattr(Config(), field.name) for field in fields(Config)}
+    for key, value in data.items():
+        values[key] = normalize_yaml_config_value(key, value)
+
+    return Config(**values)
+
 
 def ensure_frames_nhw(arr: np.ndarray) -> np.ndarray:
     """
@@ -708,29 +817,33 @@ def run_tracking(cfg: Config):
 
 
 if __name__ == "__main__":
-    cfg = Config(
-        data_path=r"./data/exp_001/thermal_data_fixed.mat",
-        out_dir=r"./result/exp_001",
-        raw_fps=100.0,
-        sample_fps=1.0,
+    parser = argparse.ArgumentParser(description="Ice boundary tracking from thermal image sequences.")
+    parser.add_argument("--config", type=str, default=None, help="Path to a YAML config file.")
+    args = parser.parse_args()
 
-        heat_on_time_in_file_s=0.0,
+    if args.config:
+        cfg = load_config_from_yaml(args.config)
+    else:
+        cfg = Config(
+            data_path=r"./data/exp_001/thermal_data_fixed.mat",
+            out_dir=r"./result/exp_001",
+            raw_fps=100.0,
+            sample_fps=1.0,
 
-        # 必须根据第一帧红外图实际修改
-        select_roi_interactively=True,
-        force_reselect_roi=False,
-        roi_config_path=None,
+            heat_on_time_in_file_s=0.0,
 
-        initial_ice_diameter_mm=60.0,
-        #初始冰区面积 为了换算起初冰元素像素点
-        completion_area_ratio=0.03,
-        continuous_seconds=3.0,
-        # 第一轮调试：关闭升温速率筛选和时间连续约束，只看单帧分割是否正确
-        use_heating_rate=False,
-        use_temporal_constraint=True ,
-        ice_polarity='low',
-        rate_lag_s=5.0,#与使用温度速率判别有关
-        visible_complete_interval_s=(110.0, 120.0),
-    )
+            select_roi_interactively=True,
+            force_reselect_roi=False,
+            roi_config_path=None,
+
+            initial_ice_diameter_mm=60.0,
+            completion_area_ratio=0.03,
+            continuous_seconds=3.0,
+            use_heating_rate=False,
+            use_temporal_constraint=True,
+            ice_polarity="low",
+            rate_lag_s=5.0,
+            visible_complete_interval_s=(110.0, 120.0),
+        )
 
     run_tracking(cfg)

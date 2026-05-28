@@ -1,0 +1,26 @@
+data_path: "./data/exp_001/thermal_data_fixed.mat"
+out_dir: "./result/exp_001"
+raw_fps: 100.0
+sample_fps: 1.0
+heat_on_time_in_file_s: 0.0
+
+select_roi_interactively: true
+force_reselect_roi: false
+roi_config_path: null
+roi: [180, 120, 280, 260]
+ref_roi: [20, 20, 20, 20]
+
+initial_ice_diameter_mm: 60.0
+completion_area_ratio: 0.03
+continuous_seconds: 3.0
+min_blob_ratio: 0.0005
+rate_lag_s: 5.0
+use_heating_rate: false
+use_temporal_constraint: true
+ice_polarity: "low"
+
+morph_kernel_size: 3
+allowed_dilate_iter: 2
+area_smooth_window_s: 3.0
+save_overlay_every_s: 1.0
+visible_complete_interval_s: [110.0, 120.0]
