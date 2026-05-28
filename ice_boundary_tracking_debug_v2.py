@@ -565,6 +565,66 @@ def remove_small_components(mask: np.ndarray, min_area: int) -> np.ndarray:
     return out.astype(bool)
 
 
+def analyze_ice_components(mask, pixel_area_mm2=None):
+    mask_u8 = (np.asarray(mask).astype(bool)).astype(np.uint8)
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(mask_u8, connectivity=8)
+
+    components = []
+    total_area_px = 0
+    total_contour_length_px = 0.0
+
+    for label in range(1, num_labels):
+        area_px = int(stats[label, cv2.CC_STAT_AREA])
+        if area_px <= 0:
+            continue
+
+        component_mask = (labels == label).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contour_length_px = float(sum(cv2.arcLength(contour, True) for contour in contours))
+
+        area_mm2 = area_px * pixel_area_mm2 if pixel_area_mm2 is not None else None
+        component = {
+            "label": int(label),
+            "area_px": area_px,
+            "area_mm2": area_mm2,
+            "centroid_x": float(centroids[label][0]),
+            "centroid_y": float(centroids[label][1]),
+            "bbox_x": int(stats[label, cv2.CC_STAT_LEFT]),
+            "bbox_y": int(stats[label, cv2.CC_STAT_TOP]),
+            "bbox_w": int(stats[label, cv2.CC_STAT_WIDTH]),
+            "bbox_h": int(stats[label, cv2.CC_STAT_HEIGHT]),
+            "contour_length_px": contour_length_px,
+        }
+        components.append(component)
+
+        total_area_px += area_px
+        total_contour_length_px += contour_length_px
+
+    component_count = len(components)
+    largest = max(components, key=lambda item: item["area_px"], default=None)
+    largest_area_px = largest["area_px"] if largest is not None else 0
+    largest_area_mm2 = (
+        largest_area_px * pixel_area_mm2
+        if pixel_area_mm2 is not None and largest is not None
+        else None
+    )
+    total_area_mm2 = total_area_px * pixel_area_mm2 if pixel_area_mm2 is not None else None
+    largest_area_ratio = largest_area_px / total_area_px if total_area_px > 0 else 0.0
+    mean_component_area_px = total_area_px / component_count if component_count > 0 else 0.0
+
+    return {
+        "component_count": component_count,
+        "total_area_px": int(total_area_px),
+        "total_area_mm2": total_area_mm2,
+        "largest_area_px": int(largest_area_px),
+        "largest_area_mm2": largest_area_mm2,
+        "largest_area_ratio": float(largest_area_ratio),
+        "total_contour_length_px": float(total_contour_length_px),
+        "mean_component_area_px": float(mean_component_area_px),
+        "components": components,
+    }
+
+
 def morphology_clean(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     mask_u8 = mask.astype(np.uint8) * 255
@@ -623,7 +683,7 @@ def segment_ice_frame(frame, cfg, prev_mask=None, lag_frame=None, dt_lag=None):
     return mask, info
 
 
-def save_overlay_image(roi_u8, mask, save_path, time_s, alpha=None):
+def save_overlay_image(roi_u8, mask, save_path, time_s, alpha=None, component_stats=None):
     color = cv2.applyColorMap(roi_u8, cv2.COLORMAP_INFERNO)
     mask_u8 = mask.astype(np.uint8) * 255
     contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
@@ -633,6 +693,14 @@ def save_overlay_image(roi_u8, mask, save_path, time_s, alpha=None):
     if alpha is not None:
         text += f", alpha = {alpha:.3f}"
     cv2.putText(color, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
+    if component_stats is not None:
+        comp_text = (
+            f"components = {component_stats['component_count']}, "
+            f"largest = {component_stats['largest_area_ratio']:.3f}"
+        )
+        cv2.putText(color, comp_text, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
     cv2.imwrite(save_path, color)
 
 
@@ -682,6 +750,7 @@ def run_tracking(cfg: Config):
 
     prev_mask = None
     records = []
+    component_records = []
     rate_lag_frames = max(1, int(round(cfg.rate_lag_s * cfg.sample_fps)))
     save_every_frames = max(1, int(round(cfg.save_overlay_every_s * cfg.sample_fps)))
 
@@ -712,6 +781,7 @@ def run_tracking(cfg: Config):
             min_blob_area = max(5, int(A0_px * cfg.min_blob_ratio))
 
         mask = remove_small_components(mask, min_blob_area)
+        component_stats = analyze_ice_components(mask, pixel_area_mm2)
 
         area_px = int(np.sum(mask))
         area_mm2 = area_px * pixel_area_mm2
@@ -726,13 +796,34 @@ def run_tracking(cfg: Config):
             "p5": info["p5"],
             "p95": info["p95"],
             "otsu_thr": info["otsu_thr"],
+            "component_count": component_stats["component_count"],
+            "largest_area_px": component_stats["largest_area_px"],
+            "largest_area_mm2": component_stats["largest_area_mm2"],
+            "largest_area_ratio": component_stats["largest_area_ratio"],
+            "total_contour_length_px": component_stats["total_contour_length_px"],
+            "mean_component_area_px": component_stats["mean_component_area_px"],
         })
+
+        for component in component_stats["components"]:
+            component_records.append({
+                "time_s": float(t),
+                "component_label": component["label"],
+                "area_px": component["area_px"],
+                "area_mm2": component["area_mm2"],
+                "centroid_x": component["centroid_x"],
+                "centroid_y": component["centroid_y"],
+                "bbox_x": component["bbox_x"],
+                "bbox_y": component["bbox_y"],
+                "bbox_w": component["bbox_w"],
+                "bbox_h": component["bbox_h"],
+                "contour_length_px": component["contour_length_px"],
+            })
 
         prev_mask = mask.copy()
 
         if i % save_every_frames == 0:
             save_path = os.path.join(overlay_dir, f"overlay_t_{t:07.2f}s.png")
-            save_overlay_image(info["roi_u8"], mask, save_path, t, alpha_raw)
+            save_overlay_image(info["roi_u8"], mask, save_path, t, alpha_raw, component_stats)
 
     df = pd.DataFrame(records)
 
@@ -769,6 +860,26 @@ def run_tracking(cfg: Config):
 
     csv_path = os.path.join(cfg.out_dir, "result_table.csv")
     df.to_csv(csv_path, index=False, encoding="utf-8-sig")
+
+    components_csv_path = os.path.join(cfg.out_dir, "components_table.csv")
+    component_columns = [
+        "time_s",
+        "component_label",
+        "area_px",
+        "area_mm2",
+        "centroid_x",
+        "centroid_y",
+        "bbox_x",
+        "bbox_y",
+        "bbox_w",
+        "bbox_h",
+        "contour_length_px",
+    ]
+    pd.DataFrame(component_records, columns=component_columns).to_csv(
+        components_csv_path,
+        index=False,
+        encoding="utf-8-sig",
+    )
 
     plt.figure(figsize=(8, 5))
     plt.plot(df["time_s"], df["alpha_raw"], label="raw area ratio", alpha=0.5)
@@ -809,6 +920,7 @@ def run_tracking(cfg: Config):
 
     print("[INFO] 处理完成")
     print(f"[INFO] 结果表: {csv_path}")
+    print(f"[INFO] 连通域明细表: {components_csv_path}")
     print(f"[INFO] 面积曲线: {curve_path}")
     print(f"[INFO] 总结文件: {summary_path}")
     print(f"[INFO] {visible_result}")
