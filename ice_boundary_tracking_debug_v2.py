@@ -274,21 +274,6 @@ def clamp_roi(roi: Tuple[int, int, int, int], frame_shape: Tuple[int, int]) -> T
     w = max(1, min(int(w), W - x))
     h = max(1, min(int(h), H - y))
     return x, y, w, h
-roi: Tuple[int, int, int, int] = (180, 120, 280, 260)
-ref_roi: Optional[Tuple[int, int, int, int]] = (20, 20, 20, 20)
-
-# ROI 使用方式：
-# True：第一次运行时用鼠标框选 ROI，并保存到 roi_config.json
-# False：直接使用上面手动写的 roi/ref_roi
-select_roi_interactively: bool = True
-
-# True：即使已经有 roi_config.json，也重新框选
-# False：优先读取已有 roi_config.json
-force_reselect_roi: bool = False
-
-# None：默认保存到 thermal_data.mat 同文件夹下的 roi_config.json
-# 也可以手动指定，例如 r"./data/exp_001/roi_config.json"
-roi_config_path: Optional[str] = None
 
 def get_roi_config_path(cfg: Config) -> Path:
     """
@@ -554,13 +539,6 @@ def find_completion_time(times, alpha, eps, continuous_s):
 
 
 def run_tracking(cfg: Config):
-    cfg.out_dir = make_run_dir(cfg)
-
-    overlay_dir = os.path.join(cfg.out_dir, "overlays")
-    os.makedirs(overlay_dir, exist_ok=True)
-
-    print(f"[INFO] 本次运行结果目录: {cfg.out_dir}")
-
     print("[INFO] 正在读取红外数据...")
     print(f"[INFO] 调试参数: use_heating_rate={cfg.use_heating_rate}, "
           f"use_temporal_constraint={cfg.use_temporal_constraint}, "
@@ -570,6 +548,11 @@ def run_tracking(cfg: Config):
     print(f"[INFO] 数据尺寸: N={total_frames}, H={H}, W={W}")
 
     prepare_rois(cfg, frames[0], (H, W))
+
+    cfg.out_dir = make_run_dir(cfg)
+    overlay_dir = os.path.join(cfg.out_dir, "overlays")
+    os.makedirs(overlay_dir, exist_ok=True)
+    print(f"[INFO] Run result dir: {cfg.out_dir}")
 
     roi_preview_path = os.path.join(cfg.out_dir, "roi_preview.png")
     save_roi_preview(frames[0], cfg, roi_preview_path)
@@ -734,10 +717,6 @@ if __name__ == "__main__":
         heat_on_time_in_file_s=0.0,
 
         # 必须根据第一帧红外图实际修改
-        # First-frame ice disk candidate: x=325..453, y=399..512.
-        # Keep a small margin around it, but avoid the lamp and most of the cold stage.
-        roi=(303, 388, 173, 124),
-        ref_roi=(105, 40, 146, 173),
         select_roi_interactively=True,
         force_reselect_roi=False,
         roi_config_path=None,
@@ -755,9 +734,3 @@ if __name__ == "__main__":
     )
 
     run_tracking(cfg)
-
-
-
-
-
-哈哈哈哈哈哈
