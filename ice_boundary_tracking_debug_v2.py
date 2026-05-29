@@ -71,8 +71,21 @@ class Config:
     # 冰区在归一化图像中是低值还是高值：'low'、'high'
     # 先分别跑 low/high，对比 overlays 哪个边界更贴近真实冰边界
     ice_polarity: str = 'low'
+    ice_shape_mode: str = "auto"
 
     morph_kernel_size: int = 3
+    morph_open_iter_regular: int = 1
+    morph_close_iter_regular: int = 2
+    morph_fill_holes_regular: bool = True
+    morph_open_iter_irregular: int = 1
+    morph_close_iter_irregular: int = 1
+    morph_fill_holes_irregular: bool = True
+    morph_open_iter_scattered: int = 0
+    morph_close_iter_scattered: int = 0
+    morph_fill_holes_scattered: bool = False
+    min_blob_ratio_regular: float = 0.0005
+    min_blob_ratio_irregular: float = 0.0002
+    min_blob_ratio_scattered: float = 0.00005
     allowed_dilate_iter: int = 2
     area_smooth_window_s: float = 3.0
     save_overlay_every_s: float = 1.0
@@ -625,12 +638,79 @@ def analyze_ice_components(mask, pixel_area_mm2=None):
     }
 
 
-def morphology_clean(mask: np.ndarray, kernel_size: int = 5) -> np.ndarray:
+def resolve_ice_shape_mode(cfg, initial_component_stats=None) -> str:
+    mode = str(cfg.ice_shape_mode).lower()
+    valid_modes = {"regular", "irregular", "scattered", "auto"}
+    if mode not in valid_modes:
+        raise ValueError("ice_shape_mode must be one of: regular, irregular, scattered, auto")
+
+    if mode != "auto":
+        return mode
+
+    cached_mode = getattr(cfg, "_resolved_shape_mode", None)
+    if cached_mode in {"regular", "irregular", "scattered"} and initial_component_stats is None:
+        return cached_mode
+
+    if initial_component_stats is None:
+        return "irregular"
+
+    component_count = initial_component_stats["component_count"]
+    largest_area_ratio = initial_component_stats["largest_area_ratio"]
+
+    if component_count <= 2 and largest_area_ratio > 0.75:
+        return "regular"
+    if component_count > 10 and largest_area_ratio < 0.5:
+        return "scattered"
+    return "irregular"
+
+
+def get_shape_mode_params(cfg, initial_component_stats=None):
+    mode = resolve_ice_shape_mode(cfg, initial_component_stats)
+
+    if mode == "regular":
+        return {
+            "resolved_shape_mode": mode,
+            "min_blob_ratio": cfg.min_blob_ratio_regular,
+            "open_iter": cfg.morph_open_iter_regular,
+            "close_iter": cfg.morph_close_iter_regular,
+            "fill_holes_enabled": cfg.morph_fill_holes_regular,
+        }
+    if mode == "irregular":
+        return {
+            "resolved_shape_mode": mode,
+            "min_blob_ratio": cfg.min_blob_ratio_irregular,
+            "open_iter": cfg.morph_open_iter_irregular,
+            "close_iter": cfg.morph_close_iter_irregular,
+            "fill_holes_enabled": cfg.morph_fill_holes_irregular,
+        }
+    if mode == "scattered":
+        return {
+            "resolved_shape_mode": mode,
+            "min_blob_ratio": cfg.min_blob_ratio_scattered,
+            "open_iter": cfg.morph_open_iter_scattered,
+            "close_iter": cfg.morph_close_iter_scattered,
+            "fill_holes_enabled": cfg.morph_fill_holes_scattered,
+        }
+
+    raise ValueError(f"unsupported resolved ice shape mode: {mode}")
+
+
+def morphology_clean(
+    mask: np.ndarray,
+    kernel_size: int = 5,
+    open_iter: int = 1,
+    close_iter: int = 2,
+    fill_holes_enabled: bool = True,
+) -> np.ndarray:
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
     mask_u8 = mask.astype(np.uint8) * 255
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=1)
-    mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return fill_holes(mask_u8 > 0)
+    if open_iter > 0:
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel, iterations=int(open_iter))
+    if close_iter > 0:
+        mask_u8 = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel, iterations=int(close_iter))
+    if fill_holes_enabled:
+        return fill_holes(mask_u8 > 0)
+    return mask_u8 > 0
 
 
 def segment_ice_frame(frame, cfg, prev_mask=None, lag_frame=None, dt_lag=None):
@@ -671,7 +751,14 @@ def segment_ice_frame(frame, cfg, prev_mask=None, lag_frame=None, dt_lag=None):
         ) > 0
         mask = mask & allowed
 
-    mask = morphology_clean(mask, cfg.morph_kernel_size)
+    shape_params = get_shape_mode_params(cfg)
+    mask = morphology_clean(
+        mask,
+        cfg.morph_kernel_size,
+        shape_params["open_iter"],
+        shape_params["close_iter"],
+        shape_params["fill_holes_enabled"],
+    )
 
     info = {
         "ref_temp": ref_temp,
@@ -767,18 +854,27 @@ def run_tracking(cfg: Config):
 
         mask, info = segment_ice_frame(frame, cfg, prev_mask, lag_frame, dt_lag)
 
+        if A0_px is None and str(cfg.ice_shape_mode).lower() == "auto" and not hasattr(cfg, "_resolved_shape_mode"):
+            initial_component_stats = analyze_ice_components(mask)
+            resolved_shape_mode = resolve_ice_shape_mode(cfg, initial_component_stats)
+            cfg._resolved_shape_mode = resolved_shape_mode
+            print(f"[INFO] Auto ice shape mode resolved as: {resolved_shape_mode}")
+            mask, info = segment_ice_frame(frame, cfg, prev_mask, lag_frame, dt_lag)
+
         if A0_px is None:
             A0_px = int(np.sum(mask))
             if A0_px <= 0:
                 raise RuntimeError("初始帧没有识别到冰区，请检查ROI或阈值处理结果。")
             initial_area_mm2 = np.pi * (cfg.initial_ice_diameter_mm / 2.0) ** 2
             pixel_area_mm2 = initial_area_mm2 / A0_px
-            min_blob_area = max(5, int(A0_px * cfg.min_blob_ratio))
+            shape_params = get_shape_mode_params(cfg)
+            min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
             print(f"[INFO] 初始冰区像素面积 A0 = {A0_px} px")
             print(f"[INFO] pixel_area = {pixel_area_mm2:.4f} mm^2/px")
             print(f"[INFO] 最小连通域面积阈值 = {min_blob_area} px")
         else:
-            min_blob_area = max(5, int(A0_px * cfg.min_blob_ratio))
+            shape_params = get_shape_mode_params(cfg)
+            min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
 
         mask = remove_small_components(mask, min_blob_area)
         component_stats = analyze_ice_components(mask, pixel_area_mm2)
@@ -911,6 +1007,8 @@ def run_tracking(cfg: Config):
         f.write(f"处理帧率: {cfg.sample_fps} fps\n")
         f.write(f"ROI: {cfg.roi}\n")
         f.write(f"Ref ROI: {cfg.ref_roi}\n")
+        f.write(f"ice_shape_mode: {cfg.ice_shape_mode}\n")
+        f.write(f"resolved_shape_mode: {get_shape_mode_params(cfg)['resolved_shape_mode']}\n")
         f.write(f"初始冰区面积: {A0_px} px\n")
         f.write(f"像素面积换算: {pixel_area_mm2:.6f} mm^2/px\n")
         f.write(f"完全融冰面积阈值: {cfg.completion_area_ratio}\n")

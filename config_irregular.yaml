@@ -1,3 +1,4 @@
+# Scenario: irregular residual ice, usually fragmented but not many tiny scattered points.
 data_path: "./data/exp_001/thermal_data_fixed.mat"
 out_dir: "./result/exp_001"
 raw_fps: 100.0
@@ -18,7 +19,7 @@ rate_lag_s: 5.0
 use_heating_rate: false
 use_temporal_constraint: true
 ice_polarity: "low"
-ice_shape_mode: "auto"
+ice_shape_mode: "irregular"
 
 morph_kernel_size: 3
 morph_open_iter_regular: 1
