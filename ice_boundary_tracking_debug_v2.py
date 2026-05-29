@@ -58,6 +58,10 @@ class Config:
     # 也可以手动指定，例如 r"./data/exp_001/roi_config.json"
     roi_config_path: Optional[str] = None
     initial_ice_diameter_mm: float = 60.0
+    init_area_seconds: float = 3.0
+    init_area_min_valid_ratio: float = 0.5
+    init_area_cv_warning: float = 0.25
+    init_area_method: str = "median"
     completion_area_ratio: float = 0.03
     continuous_seconds: float = 3.0
     min_blob_ratio: float = 0.0005
@@ -802,6 +806,86 @@ def find_completion_time(times, alpha, eps, continuous_s):
     return None
 
 
+def estimate_initial_area(frames_s, times, cfg, pixel_area_mm2=None):
+    if str(cfg.init_area_method).lower() != "median":
+        raise ValueError("A0估计方法暂时只支持 median，请检查 init_area_method。")
+
+    if len(frames_s) == 0 or len(times) == 0:
+        raise RuntimeError("A0估计失败：没有可用帧，请检查数据和 heat_on_time_in_file_s。")
+
+    times = np.asarray(times)
+    candidate_indices = np.where((times >= 0.0) & (times <= cfg.init_area_seconds))[0]
+    if len(candidate_indices) == 0:
+        candidate_indices = np.array([0], dtype=int)
+
+    if str(cfg.ice_shape_mode).lower() == "auto" and not hasattr(cfg, "_resolved_shape_mode"):
+        first_idx = int(candidate_indices[0])
+        first_mask, _ = segment_ice_frame(frames_s[first_idx], cfg, prev_mask=None, lag_frame=None, dt_lag=None)
+        initial_component_stats = analyze_ice_components(first_mask)
+        resolved_shape_mode = resolve_ice_shape_mode(cfg, initial_component_stats)
+        cfg._resolved_shape_mode = resolved_shape_mode
+        print(f"[INFO] Auto ice shape mode resolved as: {resolved_shape_mode}")
+
+    shape_params = get_shape_mode_params(cfg)
+    _, _, roi_w, roi_h = cfg.roi
+    roi_area_px = int(roi_w * roi_h)
+    bootstrap_ratio = min(shape_params["min_blob_ratio"], cfg.min_blob_ratio_scattered)
+    min_blob_area_bootstrap = max(5, int(roi_area_px * bootstrap_ratio))
+
+    values = []
+    for idx in candidate_indices:
+        mask, _ = segment_ice_frame(frames_s[int(idx)], cfg, prev_mask=None, lag_frame=None, dt_lag=None)
+        mask = remove_small_components(mask, min_blob_area_bootstrap)
+        component_stats = analyze_ice_components(mask, pixel_area_mm2)
+        area_px = int(component_stats["total_area_px"])
+        if area_px > 0:
+            values.append(area_px)
+
+    frames_used = int(len(candidate_indices))
+    valid_frames = int(len(values))
+    warning_parts = []
+
+    if valid_frames == 0:
+        raise RuntimeError(
+            "A0估计失败：初始窗口内没有识别到有效冰区，请检查 ROI、ice_polarity 或 ice_shape_mode。"
+        )
+
+    valid_ratio = valid_frames / frames_used if frames_used > 0 else 0.0
+    values_arr = np.asarray(values, dtype=np.float64)
+    median_area = float(np.median(values_arr))
+    mean_area = float(np.mean(values_arr))
+    std_area = float(np.std(values_arr))
+    cv_area = float(std_area / mean_area) if mean_area > 0 else 0.0
+
+    if valid_ratio < cfg.init_area_min_valid_ratio:
+        warning_parts.append(
+            f"有效帧比例 {valid_ratio:.3f} 低于阈值 {cfg.init_area_min_valid_ratio:.3f}，A0回退到第一帧有效面积。"
+        )
+        A0_px = int(values[0])
+    else:
+        A0_px = int(round(median_area))
+
+    if cv_area > cfg.init_area_cv_warning:
+        warning_parts.append(
+            f"初始面积变异系数 {cv_area:.3f} 高于阈值 {cfg.init_area_cv_warning:.3f}，请检查初始分割稳定性。"
+        )
+
+    warning = "；".join(warning_parts) if warning_parts else "无"
+
+    return {
+        "A0_px": A0_px,
+        "init_area_frames_used": frames_used,
+        "init_area_valid_frames": valid_frames,
+        "init_area_values": [int(v) for v in values],
+        "init_area_median": median_area,
+        "init_area_mean": mean_area,
+        "init_area_std": std_area,
+        "init_area_cv": cv_area,
+        "init_area_warning": warning,
+        "min_blob_area_bootstrap": int(min_blob_area_bootstrap),
+    }
+
+
 def run_tracking(cfg: Config):
     print("[INFO] 正在读取红外数据...")
     print(f"[INFO] 调试参数: use_heating_rate={cfg.use_heating_rate}, "
@@ -841,8 +925,16 @@ def run_tracking(cfg: Config):
     rate_lag_frames = max(1, int(round(cfg.rate_lag_s * cfg.sample_fps)))
     save_every_frames = max(1, int(round(cfg.save_overlay_every_s * cfg.sample_fps)))
 
-    A0_px = None
-    pixel_area_mm2 = None
+    init_area_info = estimate_initial_area(frames_s, times, cfg)
+    A0_px = int(init_area_info["A0_px"])
+    initial_area_mm2 = np.pi * (cfg.initial_ice_diameter_mm / 2.0) ** 2
+    pixel_area_mm2 = initial_area_mm2 / A0_px
+    shape_params = get_shape_mode_params(cfg)
+    min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
+    print(f"[INFO] A0 estimated from initial window = {A0_px} px")
+    print(f"[INFO] A0 estimation warning: {init_area_info['init_area_warning']}")
+    print(f"[INFO] pixel_area = {pixel_area_mm2:.4f} mm^2/px")
+    print(f"[INFO] 最小连通域面积阈值 = {min_blob_area} px")
 
     for i, (frame, t) in enumerate(zip(frames_s, times)):
         if i - rate_lag_frames >= 0:
@@ -854,28 +946,8 @@ def run_tracking(cfg: Config):
 
         mask, info = segment_ice_frame(frame, cfg, prev_mask, lag_frame, dt_lag)
 
-        if A0_px is None and str(cfg.ice_shape_mode).lower() == "auto" and not hasattr(cfg, "_resolved_shape_mode"):
-            initial_component_stats = analyze_ice_components(mask)
-            resolved_shape_mode = resolve_ice_shape_mode(cfg, initial_component_stats)
-            cfg._resolved_shape_mode = resolved_shape_mode
-            print(f"[INFO] Auto ice shape mode resolved as: {resolved_shape_mode}")
-            mask, info = segment_ice_frame(frame, cfg, prev_mask, lag_frame, dt_lag)
-
-        if A0_px is None:
-            A0_px = int(np.sum(mask))
-            if A0_px <= 0:
-                raise RuntimeError("初始帧没有识别到冰区，请检查ROI或阈值处理结果。")
-            initial_area_mm2 = np.pi * (cfg.initial_ice_diameter_mm / 2.0) ** 2
-            pixel_area_mm2 = initial_area_mm2 / A0_px
-            shape_params = get_shape_mode_params(cfg)
-            min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
-            print(f"[INFO] 初始冰区像素面积 A0 = {A0_px} px")
-            print(f"[INFO] pixel_area = {pixel_area_mm2:.4f} mm^2/px")
-            print(f"[INFO] 最小连通域面积阈值 = {min_blob_area} px")
-        else:
-            shape_params = get_shape_mode_params(cfg)
-            min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
-
+        shape_params = get_shape_mode_params(cfg)
+        min_blob_area = max(5, int(A0_px * shape_params["min_blob_ratio"]))
         mask = remove_small_components(mask, min_blob_area)
         component_stats = analyze_ice_components(mask, pixel_area_mm2)
 
@@ -1009,6 +1081,16 @@ def run_tracking(cfg: Config):
         f.write(f"Ref ROI: {cfg.ref_roi}\n")
         f.write(f"ice_shape_mode: {cfg.ice_shape_mode}\n")
         f.write(f"resolved_shape_mode: {get_shape_mode_params(cfg)['resolved_shape_mode']}\n")
+        f.write(f"A0估计方法: {cfg.init_area_method}\n")
+        f.write(f"A0估计时间窗口: 0 ~ {cfg.init_area_seconds} s\n")
+        f.write(f"A0估计使用帧数: {init_area_info['init_area_frames_used']}\n")
+        f.write(f"A0有效帧数: {init_area_info['init_area_valid_frames']}\n")
+        f.write(f"A0_px: {A0_px}\n")
+        f.write(f"A0初始面积均值: {init_area_info['init_area_mean']:.3f}\n")
+        f.write(f"A0初始面积标准差: {init_area_info['init_area_std']:.3f}\n")
+        f.write(f"A0初始面积变异系数: {init_area_info['init_area_cv']:.3f}\n")
+        f.write(f"A0警告信息: {init_area_info['init_area_warning']}\n")
+        f.write(f"A0初始面积样本: {init_area_info['init_area_values']}\n")
         f.write(f"初始冰区面积: {A0_px} px\n")
         f.write(f"像素面积换算: {pixel_area_mm2:.6f} mm^2/px\n")
         f.write(f"完全融冰面积阈值: {cfg.completion_area_ratio}\n")

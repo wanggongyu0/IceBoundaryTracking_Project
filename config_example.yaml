@@ -11,6 +11,10 @@ roi: [180, 120, 280, 260]
 ref_roi: [20, 20, 20, 20]
 
 initial_ice_diameter_mm: 60.0
+init_area_seconds: 3.0
+init_area_min_valid_ratio: 0.5
+init_area_cv_warning: 0.25
+init_area_method: "median"
 completion_area_ratio: 0.03
 continuous_seconds: 3.0
 min_blob_ratio: 0.0005
